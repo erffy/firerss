@@ -1,27 +1,6 @@
 import { Settings } from '../types/settings_interface';
 
-export const ApplyColorScheme = (color_scheme?: Settings['color_scheme']) => {
-    switch (color_scheme) {
-        case 'light':
-            document.documentElement.setAttribute('color-scheme', 'light');
-            break;
-        case 'dark':
-            document.documentElement.setAttribute('color-scheme', 'dark');
-            break;
-        case 'system': {
-            const system_prefers_dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-            document.documentElement.setAttribute('color-scheme', system_prefers_dark ? 'dark' : 'light');
-            break;
-        }
-    }
-};
+export const ApplyColorScheme = (color_scheme?: Settings['color_scheme']) => document.documentElement.setAttribute('color-scheme', ((window.matchMedia('(prefers-color-scheme: dark)').matches || color_scheme === 'dark') ? 'dark' : 'light'))
 
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
-    ApplyColorScheme(e.matches ? 'dark' : 'light');
-});
-
-browser.storage.local.onChanged.addListener((changes) => {
-    if (changes.firerss_settings) {
-        ApplyColorScheme(changes.firerss_settings.newValue.color_scheme);
-    }
-});
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => ApplyColorScheme(e.matches ? 'dark' : 'light'));
+browser.storage.local.onChanged.addListener((changes) => changes.firerss_settings ? ApplyColorScheme(changes.firerss_settings.newValue.color_scheme) : false);
