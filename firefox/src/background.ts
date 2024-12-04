@@ -2,148 +2,131 @@ import { findAllFeeds } from './content';
 import { InitDefaultSettings } from './lib/init_default_settings';
 
 enum Status {
-    LOADING = 'Loading',
-    NO_FEEDS = 'No feeds found',
-    SITE_IGNORED = 'Site ignored',
-    BROWSER_PAGE = 'Browser page',
+  LOADING = 'Loading',
+  NO_FEEDS = 'No feeds found',
+  SITE_IGNORED = 'Site ignored',
+  BROWSER_PAGE = 'Browser page',
 }
 
 const popup_url = browser.runtime.getURL('/html/popup.html');
+const ACTION = browser.action;
 
-const disableIcon = (tab_id?: number, status?: Status) => {
-    browser.action.disable(tab_id ?? undefined);
-    browser.action.setIcon({ path: '/img/firerss_32_gray.png', tabId: tab_id ?? undefined });
+const sanitizeUrl = (url: string) => url.replace(/\W/gi, '');
 
-    switch (status) {
-        case Status.LOADING:
-            browser.action.setBadgeText({ text: '...', tabId: tab_id ?? undefined });
-            browser.action.setBadgeBackgroundColor({ color: '#FF6600', tabId: tab_id ?? undefined });
-            break;
-        case Status.NO_FEEDS:
-            browser.action.setBadgeText({ text: '0', tabId: tab_id ?? undefined });
-            browser.action.setBadgeBackgroundColor({ color: '#FF6600', tabId: tab_id ?? undefined });
-            break;
-        case Status.SITE_IGNORED:
-            browser.action.setBadgeText({ text: 'X', tabId: tab_id ?? undefined });
-            browser.action.setBadgeBackgroundColor({ color: '#FFFF00', tabId: tab_id ?? undefined });
-            break;
-        case Status.BROWSER_PAGE:
-            browser.action.setBadgeText({ text: 'B', tabId: tab_id ?? undefined });
-            browser.action.setBadgeBackgroundColor({ color: '#FFFF00', tabId: tab_id ?? undefined });
-            break;
-        default:
-            status = undefined;
-            break;
-    }
-    browser.action.setTitle({
-        title: 'FireRSS' + (status ? ` (${status})` : ''),
-        tabId: tab_id ?? undefined,
-    });
+const updateBadge = (tabId?: number, status?: Status, feedCount?: number) => {
+  const isTabSpecified = tabId !== undefined;
+  const tabContext = isTabSpecified ? { tabId } : {};
+
+  ACTION.disable(tabId);
+  ACTION.setIcon({ ...tabContext, path: '/img/firerss_32_gray.png' });
+
+  let badgeText = '', badgeColor = '#FF6600';
+  switch (status) {
+    case Status.LOADING:
+      badgeText = '...';
+      break;
+    case Status.NO_FEEDS:
+      badgeText = '0';
+      break;
+    case Status.SITE_IGNORED:
+      badgeText = 'X';
+      badgeColor = '#FFFF00';
+      break;
+    case Status.BROWSER_PAGE:
+      badgeText = 'B';
+      badgeColor = '#FFFF00';
+      break;
+  }
+
+  ACTION.setBadgeText({ ...tabContext, text: badgeText });
+  ACTION.setBadgeBackgroundColor({ ...tabContext, color: badgeColor });
+  ACTION.setTitle({
+    ...tabContext,
+    title: `FireRSS${status ? ` (${status})` : ''}`
+  });
 };
 
-const enableIcon = (tab_id: number, feed_urls?: string[]) => {
-    browser.action.enable(tab_id);
-    browser.action.setIcon({ path: '/img/firerss_32.png', tabId: tab_id });
-    if (feed_urls && feed_urls.length > 0) {
-        browser.action.setBadgeText({ text: feed_urls.length.toString(), tabId: tab_id });
-        browser.action.setBadgeBackgroundColor({ color: '#FF6600', tabId: tab_id });
-        browser.action.setTitle({ title: 'FireRSS (Found ' + feed_urls.length + ' feeds)', tabId: tab_id });
-    } else {
-        browser.action.setTitle({ title: 'FireRSS', tabId: tab_id });
-    }
+const updatePopupState = (tabId: number, feedUrls: string[]) => {
+  if (feedUrls.length === 0) {
+    updateBadge(tabId);
+    return;
+  }
+
+  ACTION.enable(tabId);
+  ACTION.setIcon({ tabId, path: '/img/firerss_32.png' });
+  ACTION.setBadgeText({ tabId, text: feedUrls.length.toString() });
+  ACTION.setBadgeBackgroundColor({ tabId, color: '#FF6600' });
+  ACTION.setTitle({ tabId, title: `FireRSS (Found ${feedUrls.length} feeds)` });
+
+  const popup = new URL(popup_url);
+  popup.searchParams.set('feedlinks', JSON.stringify(feedUrls));
+  ACTION.setPopup({ tabId, popup: popup.toString() });
 };
 
-const updatePopupState = (tab_id: number, feed_urls: string[]) => {
-    if (feed_urls.length == 0) {
-        disableIcon(tab_id);
-        return;
-    }
-    enableIcon(tab_id, feed_urls);
+const processSiteFeeds = async (tabId: number, tabInfo: browser.tabs.Tab) => {
+  const settings = (await browser.storage.local.get('firerss_settings')).firerss_settings ?? (await InitDefaultSettings());
+  const urlSanitized = sanitizeUrl(tabInfo.url);
+  const cachedFeeds = sessionStorage.getItem(`firerss_feeds:${urlSanitized}`);
 
-    const popup = new URL(popup_url);
-    popup.searchParams.set('feedlinks', JSON.stringify(feed_urls));
-    browser.action.setPopup({ popup: popup.toString(), tabId: tab_id });
+  if (isInvalidPage(tabInfo)) {
+    updateBadge(tabId, Status.BROWSER_PAGE);
+    return;
+  }
+
+  if (isIgnoredSite(settings.ignored_sites, tabInfo.url)) {
+    updateBadge(tabId, Status.SITE_IGNORED);
+    return;
+  }
+
+  if (cachedFeeds) {
+    const parsedFeeds = JSON.parse(cachedFeeds);
+    parsedFeeds.length > 0
+      ? updatePopupState(tabId, parsedFeeds)
+      : updateBadge(tabId, Status.NO_FEEDS);
+    return;
+  }
+
+  await executeFeedDiscovery(tabId, tabInfo, urlSanitized);
 };
 
-const injectScript = async (tab_id: number, tab_info?: browser.tabs.Tab) => {
-    const settings =
-        (await browser.storage.local.get('firerss_settings')).firerss_settings ?? (await InitDefaultSettings());
-    if (!tab_info) {
-        while (tab_info === undefined) {
-            tab_info = await browser.tabs.get(tab_id);
-            await new Promise((resolve) => setTimeout(resolve, 1000));
-        }
-        if (
-            tab_info.url === popup_url ||
-            tab_info.url === undefined ||
-            ['chrome://', 'about:', 'file://'].includes(new URL(tab_info.url).protocol)
-        ) {
-            disableIcon(tab_id, Status.BROWSER_PAGE);
-            return;
-        }
-    }
+const isInvalidPage = (tabInfo: browser.tabs.Tab) =>
+  tabInfo.url === popup_url ||
+  tabInfo.url === undefined ||
+  ['chrome://', 'about:', 'file://'].includes(new URL(tabInfo.url).protocol);
 
-    for (const site of settings.ignored_sites) {
-        if (tab_info.url.match(new RegExp(site, 'gi'))) {
-            disableIcon(tab_id, Status.SITE_IGNORED);
-            return;
-        }
-    }
+const isIgnoredSite = (ignoredSites: string[], url: string) => ignoredSites.some(site => url.match(new RegExp(site, 'gi')));
 
-    const cached_feeds = sessionStorage.getItem(`firerss_feeds:${tab_info.url.replace(/\W/gi, '')}`);
-    if (cached_feeds) {
-        if (JSON.parse(cached_feeds).length > 0) {
-            enableIcon(tab_id, JSON.parse(cached_feeds));
-            updatePopupState(tab_id, JSON.parse(cached_feeds));
-        } else {
-            disableIcon(tab_id, Status.NO_FEEDS);
-        }
-        return;
-    }
-
+const executeFeedDiscovery = async (tabId: number, tabInfo: browser.tabs.Tab, urlSanitized: string) => {
+  try {
     const injection = await browser.scripting.executeScript({
-        target: { tabId: tab_id },
-        func: findAllFeeds,
+      target: { tabId },
+      func: findAllFeeds,
     });
 
-    if (!browser.runtime.lastError) {
-        const feed_urls: string[] = [];
-        for (const result of injection) {
-            feed_urls.push(...result.result);
-        }
+    const feedUrls: string[] = injection.flatMap(result => result.result);
 
-        if (feed_urls.length > 0) {
-            sessionStorage.setItem(`firerss_feeds:${tab_info.url.replace(/\W/gi, '')}`, JSON.stringify(feed_urls));
-            updatePopupState(tab_id, feed_urls);
-        } else {
-            sessionStorage.setItem(`firerss_feeds:${tab_info.url.replace(/\W/gi, '')}`, JSON.stringify([]));
-            disableIcon(tab_id, Status.NO_FEEDS);
-        }
-    } else {
-        console.error(`Error: FireRSS: ${browser.runtime.lastError.message}`);
-    }
+    sessionStorage.setItem(`firerss_feeds:${urlSanitized}`, JSON.stringify(feedUrls));
+
+    feedUrls.length > 0 ? updatePopupState(tabId, feedUrls) : updateBadge(tabId, Status.NO_FEEDS);
+  } catch (error) {
+    console.error(`FireRSS Discovery Error: ${error}`);
+    updateBadge(tabId, Status.NO_FEEDS);
+  }
 };
 
-browser.tabs.onUpdated.addListener((tab_id, status, tab_info) => {
-    if (status.status !== 'complete') return;
-    if (!tab_info) return;
-    if (
-        tab_info.url === popup_url ||
-        tab_info.url === undefined ||
-        ['chrome://', 'about:', 'file://'].includes(new URL(tab_info.url).protocol)
-    ) {
-        disableIcon(tab_id, Status.BROWSER_PAGE);
-        return;
-    }
-    disableIcon(tab_id, Status.LOADING);
-    injectScript(tab_id);
-});
+const setupListeners = () => {
+  browser.tabs.onUpdated.addListener((tabId, status, tabInfo) => {
+    if (status.status !== 'complete' || !tabInfo) return;
+    updateBadge(tabId, Status.LOADING);
+    processSiteFeeds(tabId, tabInfo);
+  });
 
-browser.tabs.onActivated.addListener((active_info) => {
-    disableIcon(active_info.tabId);
-    injectScript(active_info.tabId);
-});
+  browser.tabs.onActivated.addListener(({ tabId }) => {
+    updateBadge(tabId);
+    browser.tabs.get(tabId).then(tabInfo => processSiteFeeds(tabId, tabInfo));
+  });
 
-browser.runtime.onInstalled.addListener(() => {
-    disableIcon();
-});
+  browser.runtime.onInstalled.addListener(() => updateBadge());
+};
+
+setupListeners();
